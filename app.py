@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 import streamlit as st
 from supabase import Client, create_client
-from openai import OpenAI
+import requests
 
 # Load environment variables from .env at startup (override any existing so .env wins)
 _load_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -36,24 +36,23 @@ def get_supabase_client() -> Client:
 
 
 @st.cache_resource(show_spinner=False)
-def get_openai_client() -> Optional[OpenAI]:
+def get_gemini_api_key() -> Optional[str]:
     """
-    Create and cache an OpenAI client using `OPENAI_API_KEY` from `.env` or
-    Streamlit secrets. No in-app key entry is required.
+    Get the Gemini API key from `GEMINI_API_KEY` or Streamlit secrets.
     """
-    api_key: Optional[str] = os.getenv("OPENAI_API_KEY")
+    api_key: Optional[str] = os.getenv("GEMINI_API_KEY")
 
     # Optionally override with Streamlit secrets if configured
     try:
-        if "openai" in st.secrets:
-            api_key = st.secrets["openai"].get("api_key", api_key)
+        if "gemini" in st.secrets:
+            api_key = st.secrets["gemini"].get("api_key", api_key)
     except Exception:
         pass
 
     if not api_key or not api_key.strip():
         return None
 
-    return OpenAI(api_key=api_key.strip())
+    return api_key.strip()
 
 
 def fetch_meetings(supabase: Client) -> List[Dict[str, Any]]:
@@ -251,7 +250,7 @@ def render_kanban(meetings: List[Dict[str, Any]]) -> None:
             st.markdown("</div>", unsafe_allow_html=True)
 
 
-def render_chat_interface(openai_client: OpenAI, active_meeting: Dict[str, Any]) -> None:
+def render_chat_interface(gemini_api_key: str, active_meeting: Dict[str, Any]) -> None:
     st.subheader("Chat with Meeting")
 
     transcript = active_meeting.get("summarized_transcript", "") or ""
@@ -286,49 +285,75 @@ def render_chat_interface(openai_client: OpenAI, active_meeting: Dict[str, Any])
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Call OpenAI
+    # Call Gemini via HTTP API
     try:
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                completion = openai_client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        *chats[meeting_id_str],
-                    ],
+                conversation_lines: List[str] = []
+                for msg in chats[meeting_id_str]:
+                    role = msg["role"]
+                    prefix = "User" if role == "user" else "Assistant"
+                    conversation_lines.append(f"{prefix}: {msg['content']}")
+
+                full_prompt = (
+                    system_prompt
+                    + "\n\nConversation so far:\n"
+                    + "\n".join(conversation_lines)
+                    + "\nAssistant:"
                 )
-                answer = completion.choices[0].message.content
+
+                url = (
+                    "https://generativelanguage.googleapis.com/v1beta/"
+                    "models/gemini-1.5-flash-latest:generateContent"
+                )
+                resp = requests.post(
+                    url,
+                    params={"key": gemini_api_key},
+                    json={
+                        "contents": [
+                            {
+                                "parts": [
+                                    {
+                                        "text": full_prompt,
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                answer = (
+                    data.get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                    or "I wasn't able to generate an answer from Gemini."
+                )
                 st.markdown(answer)
 
         chats[meeting_id_str].append({"role": "assistant", "content": answer})
     except Exception as e:
-        error_text = str(e)
-        if "invalid_api_key" in error_text or "Incorrect API key" in error_text:
-            st.error(
-                "Your OpenAI API key is invalid. "
-                "Please update `OPENAI_API_KEY` in your `.env` file or "
-                "`st.secrets['openai']['api_key']`, then restart the app."
-            )
-        else:
-            st.error(f"Error calling OpenAI: {e}")
+        st.error(f"Error calling Gemini: {e}")
 
 
 def main() -> None:
     st.set_page_config(
-        page_title="Scholarly Record 🎓 – Meetings",
+        page_title="Scholarly Log 🎓 – Meetings",
         page_icon="📚",
         layout="wide",
     )
 
     render_global_css()
 
-    st.title("Scholarly Record 🎓")
+    st.title("Scholarly Log 🎓")
     st.caption("Manage and chat with your summarized meetings.")
 
     supabase = get_supabase_client()
     # Sidebar: new meeting + selector
     render_sidebar_new_meeting(supabase)
-    openai_client = get_openai_client()
+    gemini_api_key = get_gemini_api_key()
 
     # Main Kanban
     try:
@@ -342,11 +367,11 @@ def main() -> None:
     st.markdown("---")
     active_meeting = get_active_meeting(meetings)
     if active_meeting:
-        if openai_client is not None:
-            render_chat_interface(openai_client, active_meeting)
+        if gemini_api_key is not None:
+            render_chat_interface(gemini_api_key, active_meeting)
         else:
             st.warning(
-                "OpenAI API key is missing. Add `OPENAI_API_KEY=...` to your `.env` file and restart the app."
+                "Gemini API key is missing. Add `GEMINI_API_KEY=...` to your `.env` file and restart the app."
             )
     else:
         st.info("Select a meeting card or choose one from the sidebar to start chatting.")
