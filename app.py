@@ -7,48 +7,39 @@ import streamlit as st
 from supabase import Client, create_client
 from openai import OpenAI
 
-# Load environment variables from .env at startup
-load_dotenv()
+# Load environment variables from .env at startup (override any existing so .env wins)
+_load_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+load_dotenv(_load_env_path, override=True)
 
 
 STATUSES = ["To Record", "Recorded", "Action Items", "Archived"]
+
+# Hard-wired Supabase fallback config so the app always works
+# (env vars can still override these if you prefer).
+SUPABASE_URL_DEFAULT = "https://mcmydalfofsrmnfplfqx.supabase.co"
+SUPABASE_KEY_DEFAULT = "sb_publishable_7EtA8LB2OxcxTnrmW0rJEA_xs47zLe-"
 
 
 @st.cache_resource(show_spinner=False)
 def get_supabase_client() -> Client:
     """
-    Create and cache a Supabase client using environment variables, optionally
-    overridden by Streamlit secrets if they exist.
+    Create and cache a Supabase client.
+
+    Uses, in order of priority:
+    1. Environment variables SUPABASE_URL / SUPABASE_KEY (if set)
+    2. The known-good fallback values baked into this app.
     """
-    # Start from environment variables
-    supabase_url: Optional[str] = os.getenv("SUPABASE_URL")
-    supabase_key: Optional[str] = os.getenv("SUPABASE_KEY")
+    supabase_url = os.getenv("SUPABASE_URL") or SUPABASE_URL_DEFAULT
+    supabase_key = os.getenv("SUPABASE_KEY") or SUPABASE_KEY_DEFAULT
 
-    # Optionally override with Streamlit secrets if configured
-    try:
-        if "supabase" in st.secrets:
-            secret_conf = st.secrets["supabase"]
-            supabase_url = secret_conf.get("url", supabase_url)
-            supabase_key = secret_conf.get("key", supabase_key)
-    except Exception:
-        # If secrets are not configured, just rely on environment vars
-        pass
-
-    if not supabase_url or not supabase_key:
-        st.error(
-            "Supabase configuration missing. Please set `SUPABASE_URL` and "
-            "`SUPABASE_KEY` in `.env` (or configure `st.secrets['supabase']`)."
-        )
-        st.stop()
-
-    return create_client(supabase_url, supabase_key)
+    return create_client(supabase_url.strip(), supabase_key.strip())
 
 
 @st.cache_resource(show_spinner=False)
-def get_openai_client() -> OpenAI:
+def get_openai_client() -> Optional[OpenAI]:
     """
-    Create and cache an OpenAI client using environment variables, optionally
-    overridden by Streamlit secrets if they exist.
+    Create and cache an OpenAI client using `OPENAI_API_KEY` from `.env` or
+    Streamlit secrets. No in-app key entry is required.
     """
     api_key: Optional[str] = os.getenv("OPENAI_API_KEY")
 
@@ -57,17 +48,12 @@ def get_openai_client() -> OpenAI:
         if "openai" in st.secrets:
             api_key = st.secrets["openai"].get("api_key", api_key)
     except Exception:
-        # If secrets are not configured, just rely on environment vars
         pass
 
-    if not api_key:
-        st.error(
-            "OpenAI configuration missing. Please set `OPENAI_API_KEY` in `.env` "
-            "or configure `st.secrets['openai']['api_key']`."
-        )
-        st.stop()
+    if not api_key or not api_key.strip():
+        return None
 
-    return OpenAI(api_key=api_key)
+    return OpenAI(api_key=api_key.strip())
 
 
 def fetch_meetings(supabase: Client) -> List[Dict[str, Any]]:
@@ -166,7 +152,9 @@ def render_global_css() -> None:
     st.markdown(card_css, unsafe_allow_html=True)
 
 
-def render_sidebar_new_meeting(supabase: Client) -> None:
+def render_sidebar_new_meeting(supabase: Optional[Client]) -> None:
+    """Render the sidebar new-meeting form and meeting selector."""
+    st.sidebar.markdown("---")
     st.sidebar.header("New Meeting")
 
     with st.sidebar.form("new_meeting_form", clear_on_submit=True):
@@ -314,26 +302,33 @@ def render_chat_interface(openai_client: OpenAI, active_meeting: Dict[str, Any])
 
         chats[meeting_id_str].append({"role": "assistant", "content": answer})
     except Exception as e:
-        st.error(f"Error calling OpenAI: {e}")
+        error_text = str(e)
+        if "invalid_api_key" in error_text or "Incorrect API key" in error_text:
+            st.error(
+                "Your OpenAI API key is invalid. "
+                "Please update `OPENAI_API_KEY` in your `.env` file or "
+                "`st.secrets['openai']['api_key']`, then restart the app."
+            )
+        else:
+            st.error(f"Error calling OpenAI: {e}")
 
 
 def main() -> None:
     st.set_page_config(
-        page_title="Scholarly Record – Meetings",
+        page_title="Scholarly Record 🎓 – Meetings",
         page_icon="📚",
         layout="wide",
     )
 
     render_global_css()
 
-    st.title("Scholarly Record")
+    st.title("Scholarly Record 🎓")
     st.caption("Manage and chat with your summarized meetings.")
 
     supabase = get_supabase_client()
-    openai_client = get_openai_client()
-
     # Sidebar: new meeting + selector
     render_sidebar_new_meeting(supabase)
+    openai_client = get_openai_client()
 
     # Main Kanban
     try:
@@ -347,7 +342,12 @@ def main() -> None:
     st.markdown("---")
     active_meeting = get_active_meeting(meetings)
     if active_meeting:
-        render_chat_interface(openai_client, active_meeting)
+        if openai_client is not None:
+            render_chat_interface(openai_client, active_meeting)
+        else:
+            st.warning(
+                "OpenAI API key is missing. Add `OPENAI_API_KEY=...` to your `.env` file and restart the app."
+            )
     else:
         st.info("Select a meeting card or choose one from the sidebar to start chatting.")
 
