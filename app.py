@@ -1,4 +1,5 @@
 import os
+import time
 from datetime import date
 from typing import Any, Dict, List, Optional
 
@@ -78,6 +79,11 @@ def insert_meeting(
             "status": status,
         }
     ).execute()
+
+
+def delete_meeting(supabase: Client, meeting_id: Any) -> None:
+    """Delete a meeting by id from Supabase."""
+    supabase.table("Meetings").delete().eq("id", meeting_id).execute()
 
 
 def get_active_meeting(meetings: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -206,7 +212,7 @@ def render_sidebar_new_meeting(supabase: Optional[Client]) -> None:
         st.sidebar.caption("Unable to load meetings list.")
 
 
-def render_kanban(meetings: List[Dict[str, Any]]) -> None:
+def render_kanban(meetings: List[Dict[str, Any]], supabase: Client) -> None:
     st.subheader("Meetings")
     cols = st.columns(len(STATUSES))
 
@@ -225,13 +231,24 @@ def render_kanban(meetings: List[Dict[str, Any]]) -> None:
                 for m in status_meetings:
                     with st.container():
                         card_key = f"card_{status}_{m['id']}"
-                        # Use a button to make the card clickable
-                        if st.button(
-                            f"{m['title']}",
-                            key=card_key,
-                            help="Open chat for this meeting",
-                        ):
-                            set_active_meeting(m["id"])
+                        delete_key = f"delete_{status}_{m['id']}"
+                        row1, row2 = st.columns([4, 1])
+                        with row1:
+                            if st.button(
+                                f"{m['title']}",
+                                key=card_key,
+                                help="Open chat for this meeting",
+                            ):
+                                set_active_meeting(m["id"])
+                        with row2:
+                            if st.button("−", key=delete_key, help="Delete this meeting"):
+                                try:
+                                    delete_meeting(supabase, m["id"])
+                                    if st.session_state.get("active_meeting_id") == m["id"]:
+                                        st.session_state["active_meeting_id"] = None
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error deleting meeting: {e}")
 
                         # Render the styled card just below the button label
                         st.markdown(
@@ -285,7 +302,7 @@ def render_chat_interface(gemini_api_key: str, active_meeting: Dict[str, Any]) -
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Call Gemini via HTTP API
+    # Call Gemini via HTTP API (with long timeout and retries for robustness)
     try:
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
@@ -302,27 +319,82 @@ def render_chat_interface(gemini_api_key: str, active_meeting: Dict[str, Any]) -
                     + "\nAssistant:"
                 )
 
-                url = (
+                url_template = (
                     "https://generativelanguage.googleapis.com/v1beta/"
-                    "models/gemini-1.5-flash-latest:generateContent"
+                    "models/{}:generateContent"
                 )
-                resp = requests.post(
-                    url,
-                    params={"key": gemini_api_key},
-                    json={
-                        "contents": [
-                            {
-                                "parts": [
-                                    {
-                                        "text": full_prompt,
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    timeout=30,
-                )
-                resp.raise_for_status()
+                payload = {
+                    "contents": [
+                        {
+                            "parts": [{"text": full_prompt}]
+                        }
+                    ]
+                }
+                timeout_seconds = 120
+                max_retries = 4
+                resp = None
+                last_error: Optional[Exception] = None
+
+                for model_id in (
+                    "gemini-2.0-flash",
+                    "gemini-2.5-flash",
+                    "gemini-1.5-flash",
+                    "gemini-1.5-pro",
+                ):
+                    url = url_template.format(model_id)
+                    for attempt in range(max_retries):
+                        try:
+                            r = requests.post(
+                                url,
+                                params={"key": gemini_api_key},
+                                headers={"Content-Type": "application/json"},
+                                json=payload,
+                                timeout=timeout_seconds,
+                            )
+                            if r.status_code == 200:
+                                resp = r
+                                break
+                            if r.status_code == 404:
+                                last_error = RuntimeError(
+                                    "None of the tried Gemini models were available. "
+                                    "Check your API key and enabled models at https://aistudio.google.com/"
+                                )
+                                break
+                            if r.status_code == 429:
+                                last_error = requests.exceptions.HTTPError(
+                                    "Rate limited (429). Waiting and retrying.",
+                                    response=r,
+                                )
+                                if attempt < max_retries - 1:
+                                    wait = 8 * (attempt + 1)
+                                    time.sleep(wait)
+                                continue
+                            r.raise_for_status()
+                        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                            last_error = e
+                            if attempt < max_retries - 1:
+                                time.sleep(2 * (attempt + 1))
+                            continue
+                        except requests.exceptions.HTTPError as e:
+                            if e.response is not None:
+                                if e.response.status_code == 429 and attempt < max_retries - 1:
+                                    last_error = e
+                                    time.sleep(8 * (attempt + 1))
+                                    continue
+                                if e.response.status_code >= 500 and attempt < max_retries - 1:
+                                    last_error = e
+                                    time.sleep(2 * (attempt + 1))
+                                    continue
+                            raise
+                    if resp is not None:
+                        break
+                if resp is None:
+                    if last_error is not None:
+                        raise last_error
+                    raise RuntimeError(
+                        "Gemini could not find any of the tried models. "
+                        "Check your API key and quota at https://aistudio.google.com/"
+                    )
                 data = resp.json()
                 answer = (
                     data.get("candidates", [{}])[0]
@@ -334,6 +406,18 @@ def render_chat_interface(gemini_api_key: str, active_meeting: Dict[str, Any]) -
                 st.markdown(answer)
 
         chats[meeting_id_str].append({"role": "assistant", "content": answer})
+    except requests.exceptions.Timeout as e:
+        st.error(
+            "The request to Gemini timed out. The model may be slow or the network busy. "
+            "Please try your question again; the app will retry automatically."
+        )
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code == 429:
+            st.error(
+                "Gemini rate limit reached (too many requests). Please wait a minute and try your question again."
+            )
+        else:
+            st.error(f"Error calling Gemini: {e}")
     except Exception as e:
         st.error(f"Error calling Gemini: {e}")
 
@@ -362,7 +446,7 @@ def main() -> None:
         st.error(f"Error loading meetings from Supabase: {e}")
         meetings = []
 
-    render_kanban(meetings)
+    render_kanban(meetings, supabase)
 
     st.markdown("---")
     active_meeting = get_active_meeting(meetings)
